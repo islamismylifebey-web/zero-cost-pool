@@ -1,0 +1,27 @@
+# pool-worker.service — sample systemd USER unit for a persistent pool worker.
+#
+# Install on a warehouse host (as the `runner` user, after warehouse-init.sh):
+#   mkdir -p ~/.config/systemd/user
+#   cp pool-worker.service ~/.config/systemd/user/
+#   # edit the ExecStart line: set --head to the head node's Tailscale address
+#   # and put your POOL_TOKEN in ~/.config/pool-worker.env (mode 0600)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pool-worker
+#
+# For Colab/Kaggle-style ephemeral boxes, do NOT use this — run instead:
+#   python3 pool_worker.py --head http://100.x.y.z:8765 --token "$POOL_TOKEN" --ephemeral
+
+[Unit]
+Description=THE POOL worker agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/pool-worker.env
+ExecStart=/usr/bin/python3 %h/pool/pool_worker.py --head ${POOL_HEAD} --token ${POOL_TOKEN} --name %H
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,192 @@
+#!/usr/bin/bash -p
+# poolctl — command-line client for THE POOL head node.
+#
+# Usage:
+#   poolctl submit --name NAME [--min-cpu N] [--min-ram GB] [--gpu [TYPE]]
+#                  [--min-disk GB] [--timeout S] [--label k=v,...]
+#                  [--max-attempts N] [--idem KEY] [--env-file F] -- COMMAND...
+#   poolctl list [--state STATE]
+#   poolctl status JOBID
+#   poolctl cancel JOBID
+#   poolctl workers
+#   poolctl --check        verify we can reach the head node, change nothing
+#
+# Config: POOL_HEAD (e.g. http://100.x.y.z:8765) and POOL_TOKEN.
+# Fail-closed: refuses to run without POOL_HEAD.
+
+set +x
+set -euo pipefail
+IFS=$'\n\t'
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+readonly PATH LC_ALL
+unset CDPATH ENV BASH_ENV
+umask 077
+
+HEAD="${POOL_HEAD:-}"
+TOKEN="${POOL_TOKEN:-}"
+
+usage() { sed -n '2,/^#$/p' "$0" | sed 's/^# \{0,1\}//'; }
+
+die() { echo "poolctl: error: $*" >&2; exit 1; }
+
+need_head() { [ -n "$HEAD" ] || die "POOL_HEAD is not set (e.g. export POOL_HEAD=http://100.x.y.z:8765)"; }
+
+# api METHOD PATH [BODY-FILE] -> prints response body, fails on HTTP >= 400
+api() {
+    local method="$1" path="$2" bodyfile="${3:-}"
+    local args=(-sS -X "$method" -H 'Content-Type: application/json' -w '\n%{http_code}')
+    [ -n "$TOKEN" ] && args+=(-H "Authorization: Bearer $TOKEN")
+    [ -n "$bodyfile" ] && args+=(--data-binary "@$bodyfile")
+    local out http
+    out=$(curl "${args[@]}" --max-time 90 "$HEAD$path") || die "cannot reach head node at $HEAD"
+    http=$(printf '%s' "$out" | tail -n 1)
+    out=$(printf '%s' "$out" | sed '$d')
+    case "$http" in
+        2*) printf '%s\n' "$out" ;;
+        *) die "head node answered HTTP $http: $out" ;;
+    esac
+}
+
+cmd_check() {
+    need_head
+    api GET /health | python3 -c "import json,sys; d=json.load(sys.stdin); print('head ok:', d.get('ok'), '| jobs:', d.get('jobs'), '| workers:', d.get('workers'))"
+    echo "poolctl check: ok"
+}
+
+cmd_submit() {
+    need_head
+    local name="job" min_cpu=1 min_ram="0.5" gpu="" min_disk=0 timeout=3600
+    local labels="" max_attempts=3 idem="" env_file="" retry_on_fail="true"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name) name="$2"; shift 2 ;;
+            --min-cpu) min_cpu="$2"; shift 2 ;;
+            --min-ram) min_ram="$2"; shift 2 ;;
+            --gpu) gpu="${2:-true}"; shift; case "$gpu" in --*) gpu="true";; *) shift;; esac ;;
+            --min-disk) min_disk="$2"; shift 2 ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            --label) labels="$2"; shift 2 ;;
+            --max-attempts) max_attempts="$2"; shift 2 ;;
+            --idem) idem="$2"; shift 2 ;;
+            --env-file) env_file="$2"; shift 2 ;;
+            --no-retry) retry_on_fail="false"; shift ;;
+            --) shift; break ;;
+            *) break ;;
+        esac
+    done
+    [ $# -gt 0 ] || die "no COMMAND given after --"
+    # NOTE: this script sets IFS to newline+tab, so "$*" would join args
+    # with newlines and corrupt the command. Join with spaces explicitly.
+    local command
+    printf -v command '%s ' "$@"
+    command=${command% }
+    local env_json="{}"
+    if [ -n "$env_file" ]; then
+        [ -f "$env_file" ] || die "env file not found: $env_file"
+        env_json=$(python3 - "$env_file" <<'EOF'
+import sys
+d = {}
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line or line.startswith('#') or '=' not in line:
+        continue
+    k, v = line.split('=', 1)
+    d[k.strip()] = v.strip()
+import json; print(json.dumps(d))
+EOF
+)
+    fi
+    local needs
+    needs=$(POOL_GPU="$gpu" POOL_LABELS="$labels" python3 - <<EOF
+import json, os
+needs = {"min_cpu": float("$min_cpu"), "min_ram_gb": float("$min_ram"),
+         "min_disk_gb": float("$min_disk"), "timeout_s": int("$timeout"),
+         "retry_on_fail": "$retry_on_fail" == "true"}
+g = os.environ["POOL_GPU"]
+if g: needs["gpu"] = True if g == "true" else g
+labs = [l.strip() for l in os.environ["POOL_LABELS"].split(",") if l.strip()]
+if labs: needs["labels"] = labs
+print(json.dumps(needs))
+EOF
+)
+    local body; body=$(mktemp)
+    python3 - "$body" "$name" "$command" "$env_json" "$needs" "$max_attempts" "$idem" <<'EOF'
+import json, sys
+_, path, name, command, env_json, needs, max_attempts, idem = sys.argv
+doc = {"name": name, "command": command, "env": json.loads(env_json),
+       "needs": json.loads(needs), "max_attempts": int(max_attempts)}
+if idem: doc["idempotency_key"] = idem
+open(path, "w").write(json.dumps(doc))
+EOF
+    api POST /jobs "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['id'], '(new)' if d.get('created') else '(already queued)')"
+    rm -f "$body"
+}
+
+cmd_list() {
+    need_head
+    local state=""
+    [ "${1:-}" = "--state" ] && state="?state=$2"
+    api GET "/jobs$state" | python3 -c "
+import json, sys
+for j in json.load(sys.stdin)['jobs']:
+    n = j.get('needs') or {}
+    print('%-14s %-9s %-20s cpu>=%s ram>=%sGB%s attempts=%d/%d' % (
+        j['id'], j['state'], (j['name'] or '')[:20],
+        n.get('min_cpu', 1), n.get('min_ram_gb', 0.5),
+        ' gpu' if n.get('gpu') else '',
+        j['attempts'], j['max_attempts']))
+"
+}
+
+cmd_status() {
+    need_head
+    [ $# -ge 1 ] || die "usage: poolctl status JOBID"
+    api GET "/jobs/$1" | python3 -c "
+import json, sys
+j = json.load(sys.stdin)['job']
+print('id:      ', j['id'])
+print('name:    ', j['name'])
+print('state:   ', j['state'], '| worker:', j.get('worker_id'), '| attempts:', j['attempts'], '/', j['max_attempts'])
+print('command: ', j['command'][:200])
+r = j.get('result') or {}
+if r.get('exit_code') is not None: print('exit:    ', r['exit_code'], 'timed_out:', r.get('timed_out'))
+if r.get('error'): print('error:   ', r['error'])
+if r.get('requeued'): print('note:    ', r['requeued'])
+for art in r.get('artifacts') or []:
+    print('artifact:', art['name'], art['size'], 'bytes', art.get('sha256', '')[:12])
+for k in ('stdout', 'stderr'):
+    if r.get(k): print('--- %s (tail) ---' % k); print(r[k][-2000:])
+"
+}
+
+cmd_cancel() {
+    need_head
+    [ $# -ge 1 ] || die "usage: poolctl cancel JOBID"
+    api POST "/jobs/$1/cancel" | python3 -c "import json,sys; print('cancelled' if json.load(sys.stdin).get('ok') else 'not cancellable (already terminal or running)')"
+}
+
+cmd_workers() {
+    need_head
+    api GET /workers | python3 -c "
+import json, sys, time
+for w in json.load(sys.stdin)['workers']:
+    c = w.get('capabilities') or {}
+    age = int(time.time() - w['last_heartbeat'])
+    print('%-12s %-7s %-15s cpu=%s ram=%sGB gpu=%s disk=%sGB labels=%s hb=%ds ago' % (
+        w['id'], w['state'], (w['hostname'] or '')[:15],
+        c.get('cpu_count'), c.get('ram_gb'), c.get('gpu') or '-',
+        c.get('disk_gb'), ','.join(w.get('labels') or []) or '-', age))
+"
+}
+
+case "${1:---help}" in
+    --check) cmd_check ;;
+    submit) shift; cmd_submit "$@" ;;
+    list) shift; cmd_list "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    cancel) shift; cmd_cancel "$@" ;;
+    workers) shift; cmd_workers "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $1 (try: submit, list, status, cancel, workers, --check)" ;;
+esac
